@@ -85,23 +85,50 @@ def load_commits():
     return commits
 
 
+PR_REF = re.compile(r"\(#(\d+)\)\s*$")
+
+
 def build_identity(prs, commits):
+    """Resolve a commit to a GitHub login.
+
+    PostHog squash-merges, so a commit subject ends in "(#12345)" — that maps a
+    commit to its PR and therefore to the PR author's login exactly. Everything
+    else (noreply emails, display-name matching) is a fallback.
+    """
     logins = {}
     for p in prs:
         a = (p.get("author") or {}).get("login")
         if a:
             logins[a.lower()] = a
+    pr_author = {
+        p["number"]: p["author"]["login"] for p in prs if p.get("author")
+    }
+
+    # A commit whose subject carries a PR number teaches us that this git
+    # identity (email) belongs to that PR's author.
     email_to_login = {}
+    name_to_login = {}
+    for c in commits:
+        m = PR_REF.search(c["subject"])
+        if m:
+            login = pr_author.get(int(m.group(1)))
+            if login:
+                email_to_login.setdefault(c["email"], login)
+                name_to_login.setdefault(c["name"], login)
     for c in commits:
         m = re.match(r"^(?:\d+\+)?([\w.-]+)@users\.noreply\.github\.com$", c["email"])
         if m:
-            email_to_login[c["email"]] = logins.get(m.group(1).lower(), m.group(1))
+            email_to_login.setdefault(c["email"], logins.get(m.group(1).lower(), m.group(1)))
 
     def resolve(c):
+        m = PR_REF.search(c["subject"])
+        if m and pr_author.get(int(m.group(1))):
+            return pr_author[int(m.group(1))]
         if c["email"] in email_to_login:
             return email_to_login[c["email"]]
-        key = c["name"].lower().replace(" ", "")
-        return logins.get(key, c["name"])
+        if c["name"] in name_to_login:
+            return name_to_login[c["name"]]
+        return logins.get(c["name"].lower().replace(" ", ""), c["name"])
 
     return resolve
 
@@ -205,6 +232,8 @@ def main():
             file_lines[f["path"]][c["login"]] += f["add"]
 
     adopted_total = 0
+    downstream = defaultdict(set)    # login -> distinct other engineers building on them
+    owned_adopted = defaultdict(set)  # login -> their modules that anyone imports
     for path in tracked:
         authors = file_lines.get(path)
         if not authors:
@@ -226,8 +255,11 @@ def main():
         dep_authors.discard(owner)
 
         # Leverage credits fan-in, but pays far more for *other people* adopting it.
+        # Downstream authors are unioned across all of an owner's files — the same
+        # colleague importing ten of their modules is one adopter, not ten.
         S[owner]["fan_in"] += len(deps)
-        S[owner]["dep_authors"] += len(dep_authors)
+        downstream[owner] |= dep_authors
+        owned_adopted[owner].add(path)
         if len(dep_authors) >= 2:
             adopted_total += 1
         share = authors[owner] / max(sum(authors.values()), 1)
@@ -311,8 +343,10 @@ def main():
         s = S[login]
         if s["commits"] < MIN_COMMITS:
             continue
-        leverage = round(math.sqrt(s["fan_in"]) * 6 + s["dep_authors"] * 4
-                         + s["load_bearing"] * 5 + math.sqrt(s["unblocking"]) * 6)
+        dep_authors = len(downstream[login])
+        leverage = round(math.sqrt(s["fan_in"]) * 2.2 + dep_authors * 6
+                         + math.sqrt(len(owned_adopted[login])) * 4
+                         + s["load_bearing"] * 4 + math.sqrt(s["unblocking"]) * 6)
         delivery = round(math.sqrt(s["commits"]) * 8 + math.sqrt(s["prs"]) * 7
                          + math.sqrt(s["reviews"]) * 9)
         landed = s["lines_landed"]
@@ -331,8 +365,8 @@ def main():
             "net": leverage + delivery - drag,
             "commits": int(s["commits"]), "prs": int(s["prs"]),
             "reviews": int(s["reviews"]),
-            "adopted": len(abs_ev[login]),
-            "dep_authors": int(s["dep_authors"]),
+            "adopted": len(owned_adopted[login]),
+            "dep_authors": dep_authors,
             "fan_in": int(s["fan_in"]),
             "load_bearing": int(s["load_bearing"]),
             "unblocking": int(s["unblocking"]),
