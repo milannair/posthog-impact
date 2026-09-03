@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostHog Engineer Impact</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --text: #e8eaf0; --muted: #939bab; --dim: #6c7484;
+    --leverage: #f9bd2b; --delivery: #2f80ed; --drag: #eb5757; --accent: #f9bd2b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+  a { color: inherit; }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 14px 20px 22px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.2px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 12px; }
+  .sub b { color: var(--text); font-weight: 600; }
+
+  .layout { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .card > h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.9px; color: var(--muted);
+    margin: 0; padding: 11px 14px 9px; border-bottom: 1px solid var(--line); font-weight: 600;
+  }
+  .card > h2 .r { float: right; text-transform: none; letter-spacing: 0; color: var(--dim); font-weight: 400; }
+
+  /* leaderboard */
+  .rows { padding: 6px; }
+  .row {
+    display: grid; grid-template-columns: 22px 1fr 148px 52px; gap: 10px; align-items: center;
+    padding: 9px 8px; border-radius: 7px; cursor: pointer; border: 1px solid transparent;
+  }
+  .row:hover { background: var(--panel2); }
+  .row.sel { background: var(--panel2); border-color: #3a4152; }
+  .rank { color: var(--dim); font-variant-numeric: tabular-nums; text-align: center; font-size: 12px; }
+  .who { min-width: 0; }
+  .name { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { color: var(--dim); font-size: 11px; margin-top: 1px; }
+  .bar { display: flex; height: 15px; border-radius: 3px; overflow: hidden; background: #0b0d11; }
+  .bar i { display: block; height: 100%; }
+  .score { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 15px; text-align: right; }
+
+  .legend { display: flex; gap: 13px; padding: 8px 14px 11px; color: var(--muted); font-size: 11px; flex-wrap: wrap; }
+  .legend b { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+
+  /* weights */
+  .weights { padding: 10px 14px 12px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .w label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .w input { width: 100%; accent-color: var(--accent); }
+  .w b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  /* detail */
+  .detail { padding: 4px 0 8px; max-height: calc(100vh - 190px); overflow-y: auto; }
+  .pill-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 9px 14px 5px; font-size: 12px; font-weight: 700;
+  }
+  .pill-head em { font-style: normal; color: var(--dim); font-weight: 400; font-size: 11px; }
+  .m { padding: 4px 14px 7px; }
+  .m-top { display: grid; grid-template-columns: 1fr 62px 44px; gap: 8px; align-items: center; }
+  .m-label { font-size: 12px; cursor: help; border-bottom: 1px dotted var(--dim); justify-self: start; }
+  .m-raw { color: var(--muted); font-size: 11.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .m-track { height: 5px; background: #0b0d11; border-radius: 3px; overflow: hidden; }
+  .m-track i { display: block; height: 100%; }
+  .m-pct { font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; }
+  .ev { margin: 5px 0 0; padding: 0 0 0 12px; list-style: none; }
+  .ev li {
+    color: var(--muted); font-size: 11px; padding: 2px 0 2px 8px;
+    border-left: 2px solid var(--line); line-height: 1.4;
+  }
+  .empty { color: var(--dim); font-size: 11.5px; padding: 8px 14px; }
+  footer { color: var(--dim); font-size: 11px; margin-top: 12px; line-height: 1.6; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>PostHog · <span>Engineer Impact</span></h1>
+    <div class="sub" id="meta">loading…</div>
+  </header>
+
+  <div class="layout">
+    <div>
+      <div class="card">
+        <h2>Top engineers <span class="r" id="rankNote"></span></h2>
+        <div class="rows" id="rows"></div>
+        <div class="legend">
+          <span><b style="background:var(--leverage)"></b>Leverage — abstractions others build on</span>
+          <span><b style="background:var(--delivery)"></b>Delivery — risk-weighted shipping &amp; review</span>
+          <span><b style="background:var(--drag)"></b>Drag — rework, hotfixes &amp; reverts (subtracted)</span>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h2>Weights <span class="r">drag the sliders — ranking updates live</span></h2>
+        <div class="weights" id="weights"></div>
+      </div>
+      <footer id="foot"></footer>
+    </div>
+
+    <div class="card">
+      <h2>Breakdown <span class="r" id="selName"></span></h2>
+      <div class="detail" id="detail"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const PILLARS = [
+  ["leverage", "Leverage", "var(--leverage)", "Do other people build on what they made?"],
+  ["delivery", "Delivery", "var(--delivery)", "How much did they ship, weighted by how hard the area is?"],
+  ["drag", "Drag", "var(--drag)", "What did they leave behind for others to clean up?"],
+];
+let DATA = null, W = null, sel = null;
+
+const fmt = (n) => Number.isInteger(n) ? n.toLocaleString() : n.toFixed(1);
+
+function composite(e) {
+  return W.leverage * e.pillars.leverage.score
+       + W.delivery * e.pillars.delivery.score
+       - W.drag * e.pillars.drag.score;
+}
+
+function render() {
+  const ranked = [...DATA.engineers].sort((a, b) => composite(b) - composite(a));
+  const top = ranked.slice(0, 5);
+  if (!sel || !top.some(e => e.login === sel)) sel = top[0].login;
+
+  const maxAbs = Math.max(...top.map(e =>
+    W.leverage * e.pillars.leverage.score + W.delivery * e.pillars.delivery.score)) || 1;
+
+  document.getElementById("rows").innerHTML = top.map((e, i) => {
+    const L = W.leverage * e.pillars.leverage.score;
+    const D = W.delivery * e.pillars.delivery.score;
+    const G = W.drag * e.pillars.drag.score;
+    const px = v => (100 * v / maxAbs).toFixed(1) + "%";
+    return `<div class="row ${e.login === sel ? "sel" : ""}" data-l="${e.login}">
+      <div class="rank">${i + 1}</div>
+      <div class="who">
+        <div class="name">${e.login}</div>
+        <div class="tag">${fmt(e.raw.prs_merged || 0)} PRs · ${fmt(e.raw.commits || 0)} commits ·
+          ${fmt(e.raw.reviews_given || 0)} reviews · ${fmt(e.raw.foundation_dependents || 0)} files depend on their code</div>
+      </div>
+      <div class="bar" title="Leverage ${L.toFixed(1)} + Delivery ${D.toFixed(1)} − Drag ${G.toFixed(1)}">
+        <i style="width:${px(L)};background:var(--leverage)"></i>
+        <i style="width:${px(D)};background:var(--delivery)"></i>
+        <i style="width:${px(G)};background:var(--drag)"></i>
+      </div>
+      <div class="score">${composite(e).toFixed(1)}</div>
+    </div>`;
+  }).join("");
+
+  document.querySelectorAll(".row").forEach(r =>
+    r.onclick = () => { sel = r.dataset.l; render(); });
+
+  const e = DATA.engineers.find(x => x.login === sel);
+  document.getElementById("selName").textContent = e.login;
+  document.getElementById("detail").innerHTML = PILLARS.map(([key, label, color, blurb]) => {
+    const p = e.pillars[key];
+    const contrib = (W[key] * p.score * (key === "drag" ? -1 : 1)).toFixed(1);
+    return `<div class="pill-head" style="color:${color}">
+        <span>${label} · ${p.score.toFixed(1)}/100 <em>× weight ${W[key].toFixed(2)} = ${contrib} pts</em></span>
+        <em>${blurb}</em>
+      </div>` +
+      p.metrics.map(m => `<div class="m">
+        <div class="m-top">
+          <span class="m-label" title="${m.description}">${m.label}</span>
+          <span class="m-raw">${fmt(m.raw)}${m.key.endsWith("_pct") ? "%" : ""}</span>
+          <span class="m-pct">${m.score.toFixed(0)}th</span>
+        </div>
+        <div class="m-track"><i style="width:${m.score}%;background:${color};opacity:.75"></i></div>
+        ${m.evidence.length ? `<ul class="ev">${m.evidence.map(x => `<li>${x}</li>`).join("")}</ul>` : ""}
+      </div>`).join("");
+  }).join("");
+}
+
+fetch("metrics.json?v=" + Date.now()).then(r => r.json()).then(d => {
+  DATA = d; W = { ...d.default_weights };
+  document.getElementById("meta").innerHTML =
+    `last <b>${d.window_days} days</b> · <b>${d.totals.prs.toLocaleString()}</b> merged PRs ·
+     <b>${d.totals.commits.toLocaleString()}</b> commits ·
+     <b>${d.totals.engineers}</b> engineers ranked · ${d.repo}`;
+  document.getElementById("rankNote").textContent =
+    "every score is a percentile against the other " + d.totals.engineers + " active engineers";
+  document.getElementById("weights").innerHTML = PILLARS.map(([k, label]) =>
+    `<div class="w">
+      <label>${label} <b id="wv-${k}">${W[k].toFixed(2)}</b></label>
+      <input type="range" min="0" max="1" step="0.05" value="${W[k]}" data-k="${k}">
+    </div>`).join("");
+  document.querySelectorAll(".w input").forEach(i => i.oninput = () => {
+    W[i.dataset.k] = +i.value;
+    document.getElementById("wv-" + i.dataset.k).textContent = (+i.value).toFixed(2);
+    render();
+  });
+  document.getElementById("foot").innerHTML =
+    `Percentiles are computed within the cohort of engineers active in the window, so a score is always
+     “relative to peers”, never an absolute. Drag uses a ${d.drag_window_days}-day follow-up window after each change.
+     Bots excluded. Generated ${new Date(d.generated_at).toLocaleString()}. Hover any metric label for its exact definition.`;
+  render();
+});
+</script>
+</body>
+</html>
