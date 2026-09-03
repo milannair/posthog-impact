@@ -26,6 +26,7 @@ OWNER, NAME = "PostHog", "posthog"
 
 QUERY = """
 query($q:String!, $cursor:String) {
+  rateLimit { limit cost remaining resetAt }
   search(query:$q, type:ISSUE, first:50, after:$cursor) {
       pageInfo { hasNextPage endCursor }
       nodes { ... on PullRequest {
@@ -44,9 +45,53 @@ query($q:String!, $cursor:String) {
 """
 
 
+MAX_SLEEP = 3900  # a GraphQL budget resets hourly; never wait more than that + slack
+
+
+def api_get(path):
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        headers={"Authorization": f"bearer {TOKEN}", "User-Agent": "posthog-impact"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def graphql_reset_wait():
+    """Seconds until the GraphQL budget resets, from /rate_limit.
+
+    That endpoint is free — it does not consume points — so it is safe to call
+    precisely when we are already exhausted and the GraphQL query itself can no
+    longer tell us anything.
+    """
+    try:
+        gl = api_get("/rate_limit")["resources"]["graphql"]
+        if gl.get("remaining", 0) > 0:
+            return 0
+        return max(0, int(gl["reset"]) - int(time.time())) + 5
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not read /rate_limit ({e})", file=sys.stderr)
+        return 60
+
+
+def is_rate_limited(err):
+    text = str(err).lower()
+    return "rate_limit" in text or "rate limit" in text or "was submitted too quickly" in text
+
+
+def sleep_loudly(secs, why):
+    secs = min(secs, MAX_SLEEP)
+    until = datetime.now(timezone.utc) + timedelta(seconds=secs)
+    print(f"  {why}: sleeping {secs}s until {until.strftime('%H:%M:%S')}Z",
+          file=sys.stderr, flush=True)
+    time.sleep(secs)
+
+
 def gql(q, cursor):
     body = json.dumps({"query": QUERY, "variables": {"q": q, "cursor": cursor}}).encode()
-    for attempt in range(6):
+    attempt = 0
+    rate_waits = 0
+    while True:
         req = urllib.request.Request(
             "https://api.github.com/graphql", data=body,
             headers={"Authorization": f"bearer {TOKEN}",
@@ -58,15 +103,49 @@ def gql(q, cursor):
                 payload = json.loads(r.read())
             if payload.get("errors"):
                 raise RuntimeError(payload["errors"])
-            return payload["data"]["search"]
-        except Exception as e:  # noqa: BLE001
-            if attempt == 5:
+            data = payload["data"]
+            # Spend down to a reserve rather than into the wall: hitting zero
+            # costs a full reset, so pause once the remaining budget is thin.
+            rl = data.get("rateLimit") or {}
+            if rl.get("remaining") is not None and rl["remaining"] <= max(rl.get("cost", 1) * 3, 15):
+                reset = rl.get("resetAt")
+                wait = 60
+                if reset:
+                    wait = max(0, int((datetime.fromisoformat(
+                        reset.replace("Z", "+00:00")) - datetime.now(timezone.utc)
+                    ).total_seconds())) + 5
+                sleep_loudly(wait, f"GraphQL budget down to {rl['remaining']}")
+            return data["search"]
+        except urllib.error.HTTPError as e:
+            # Secondary limits answer with Retry-After; honour it exactly.
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            if retry_after and rate_waits < 4:
+                rate_waits += 1
+                sleep_loudly(int(retry_after) + 2, f"HTTP {e.code}, Retry-After")
+                continue
+            if e.code in (403, 429) and rate_waits < 4:
+                rate_waits += 1
+                sleep_loudly(graphql_reset_wait(), f"HTTP {e.code} rate limited")
+                continue
+            if attempt >= 4:
                 raise
-            # Secondary rate limits want a long, jittered wait — the old 2**n
-            # topped out at 8s, which is not enough to clear one.
-            delay = min(60, 5 * (2 ** attempt)) + random.uniform(0, 5)
-            print(f"  retry {attempt + 1} in {delay:.0f}s after {e}", file=sys.stderr)
-            time.sleep(delay)
+            attempt += 1
+            sleep_loudly(min(60, 5 * 2 ** attempt) + random.uniform(0, 5),
+                         f"HTTP {e.code}")
+        except Exception as e:  # noqa: BLE001
+            # A depleted GraphQL budget arrives as a 200 with an errors block, so
+            # waiting out the reset has to happen here too — the old code just
+            # backed off 63s and then abandoned the whole week.
+            if is_rate_limited(e):
+                if rate_waits >= 4:
+                    raise
+                rate_waits += 1
+                sleep_loudly(graphql_reset_wait(), "GraphQL rate limit exceeded")
+                continue
+            if attempt >= 4:
+                raise
+            attempt += 1
+            sleep_loudly(min(60, 5 * 2 ** attempt) + random.uniform(0, 5), f"error {e}")
 
 
 def slices(start, end):
@@ -141,33 +220,51 @@ def main():
     end = today + timedelta(days=1)
     start = end - timedelta(days=WINDOW_DAYS)
 
-    fetched = failed = reused = 0
+    try:
+        gl = api_get("/rate_limit")["resources"]["graphql"]
+        print(f"graphql budget: {gl['remaining']}/{gl['limit']} remaining",
+              file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+    fetched = reused = 0
+    todo = []
     for a, b in slices(start, end):
-        path = chunk_path(a, b)
         # A slice that ends today or later is still accumulating merges, so it is
         # always refetched. Completed past weeks are immutable and reused.
-        stale = b > today
-        if os.path.exists(path) and not stale:
+        if os.path.exists(chunk_path(a, b)) and b <= today:
             reused += 1
-            continue
-        try:
-            rows = fetch_slice(a, b)
-        except Exception as e:  # noqa: BLE001
-            # Keep going: one bad week shouldn't cost us the other sixteen, and
-            # the chunk is simply absent so the next run retries just this one.
-            print(f"{a}..{b}: FAILED ({e})", file=sys.stderr)
-            failed += 1
-            continue
-        write_atomic(path, rows)
-        fetched += 1
-        print(f"{a}..{b}: {len(rows)} PRs {'(refresh)' if stale else ''}",
-              file=sys.stderr)
+        else:
+            todo.append((a, b))
+
+    # Two passes: a week that fails on the first is retried at the end, by which
+    # time a rate-limit reset has usually landed. Anything still missing is left
+    # absent so the next boot picks up exactly those weeks.
+    failed = []
+    for attempt_round in (1, 2):
+        queue, failed = failed if attempt_round == 2 else todo, []
+        if attempt_round == 2 and queue:
+            print(f"retrying {len(queue)} failed week(s)", file=sys.stderr)
+        for a, b in queue:
+            try:
+                rows = fetch_slice(a, b)
+            except Exception as e:  # noqa: BLE001
+                print(f"{a}..{b}: FAILED ({e})", file=sys.stderr)
+                failed.append((a, b))
+                continue
+            write_atomic(chunk_path(a, b), rows)
+            fetched += 1
+            print(f"{a}..{b}: {len(rows)} PRs {'(refresh)' if b > today else ''}",
+                  file=sys.stderr, flush=True)
+        if not failed:
+            break
 
     # No merged prs.json: the weekly chunks on the volume *are* the dataset, and
     # analyze.py streams them one file at a time. Holding 15k PRs (with their
     # file lists) in memory here bought nothing and cost a container restart.
     print(f"weeks: {reused} cached, {fetched} fetched"
-          + (f", {failed} failed" if failed else ""), file=sys.stderr)
+          + (f", {len(failed)} still missing (next boot retries them)" if failed else ""),
+          file=sys.stderr)
     return 1 if failed and not fetched and not reused else 0
 
 
