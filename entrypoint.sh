@@ -14,10 +14,17 @@ mkdir -p "$DATA_DIR" "$CACHE_DIR" "$SERVE_DIR"
 
 # Set REBUILD=1 in Railway to force a fresh PR pull + re-analysis on next deploy
 # (the cloned repo is kept — only derived artifacts are dropped).
-if [ "${REBUILD:-0}" = "1" ]; then
-  echo "[boot] REBUILD=1 — dropping cached PR data and metrics"
-  rm -f "$CACHE_DIR/prs.json" "$METRICS_PATH"
-fi
+# REBUILD=1 drops the derived metrics and forces re-analysis, keeping the cloned
+# repo and the weekly PR chunks. REBUILD=all additionally discards the chunks and
+# re-downloads every week from GitHub.
+case "${REBUILD:-0}" in
+  all)
+    echo "[boot] REBUILD=all — discarding weekly PR chunks and metrics"
+    rm -rf "$CACHE_DIR/prs" "$CACHE_DIR/prs.json" "$METRICS_PATH" ;;
+  1)
+    echo "[boot] REBUILD=1 — dropping metrics, keeping cached PR weeks"
+    rm -f "$METRICS_PATH" ;;
+esac
 
 cp /app/web/index.html "$SERVE_DIR/index.html"
 
@@ -30,6 +37,7 @@ link_metrics() {
 if [ ! -f "$METRICS_PATH" ] && [ -f /app/web/metrics.json ]; then
   echo "[boot] seeding metrics.json from image"
   cp /app/web/metrics.json "$METRICS_PATH"
+  touch "$DATA_DIR/.seeded"
 fi
 link_metrics
 (cd "$SERVE_DIR" && python3 -m http.server "$PORT" --bind 0.0.0.0) &
@@ -51,20 +59,23 @@ build() {
         echo "[boot] clone failed"; return 1; }
   fi
 
-  # 2. PR/review data (cached on the volume).
-  if [ -f "$CACHE_DIR/prs.json" ]; then
-    echo "[boot] PR cache present, skipping GitHub fetch"
-  else
-    echo "[boot] fetching PRs from GitHub"
-    python3 /app/pipeline/fetch_github.py || { echo "[boot] fetch failed"; return 1; }
-  fi
+  # 2. PR/review data. Always run: weeks already on the volume are skipped, so
+  #    this only fetches weeks that are missing plus the current (still-growing)
+  #    one. An interrupted run resumes here instead of starting over.
+  echo "[boot] syncing PRs from GitHub (cached weeks are skipped)"
+  before=$(ls "$CACHE_DIR/prs" 2>/dev/null | wc -l | tr -d ' ')
+  python3 /app/pipeline/fetch_github.py || { echo "[boot] fetch failed"; return 1; }
+  after=$(ls "$CACHE_DIR/prs" 2>/dev/null | wc -l | tr -d ' ')
+  echo "[boot] weekly PR chunks on volume: $before -> $after"
 
-  # 3. Analysis.
-  if [ -f "$METRICS_PATH" ]; then
-    echo "[boot] metrics.json present, skipping analysis"
+  # 3. Analysis. The metrics.json baked into the image is only a placeholder so
+  #    the page has data on first boot; it must not suppress the real run.
+  if [ -f "$METRICS_PATH" ] && [ ! -f "$DATA_DIR/.seeded" ] && [ "$after" = "$before" ]; then
+    echo "[boot] metrics.json is current, skipping analysis"
   else
     echo "[boot] running analysis"
     python3 /app/pipeline/analyze.py || { echo "[boot] analysis failed"; return 1; }
+    rm -f "$DATA_DIR/.seeded"
   fi
 
   link_metrics

@@ -158,9 +158,37 @@ def fan_in_for(path, refs):
     return sum(refs.get(c, 0) for c in cands)
 
 
+def load_prs():
+    """Read the weekly PR chunks the fetcher wrote to the volume, one file at a
+    time. Falls back to a legacy single prs.json if that is all that exists."""
+    chunk_dir = os.path.join(CACHE_DIR, "prs")
+    prs, seen = [], set()
+    if os.path.isdir(chunk_dir):
+        for name in sorted(os.listdir(chunk_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(chunk_dir, name)) as f:
+                    rows = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"  skipping unreadable chunk {name}: {e}", file=sys.stderr)
+                continue
+            for p in rows:
+                if p.get("number") not in seen:
+                    seen.add(p["number"])
+                    prs.append(p)
+    if not prs:
+        legacy = os.path.join(CACHE_DIR, "prs.json")
+        if os.path.exists(legacy):
+            with open(legacy) as f:
+                prs = json.load(f)
+    if not prs:
+        sys.exit(f"no PR data found in {chunk_dir}")
+    return prs
+
+
 def main():
-    with open(os.path.join(CACHE_DIR, "prs.json")) as f:
-        prs = json.load(f)
+    prs = load_prs()
     prs = [p for p in prs if p.get("author") and not BOT_PAT.search(p["author"]["login"])]
 
     commits = load_commits()
