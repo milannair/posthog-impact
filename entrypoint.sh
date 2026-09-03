@@ -38,7 +38,9 @@ build() {
   else
     echo "[boot] first boot — cloning PostHog/posthog into $REPO_DIR"
     rm -rf "$REPO_DIR"
-    git clone --filter=blob:none --shallow-since="$(date -u -d '150 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-150d +%Y-%m-%d)" \
+    # No blob filter: `git log --numstat` needs blob contents, and a blobless
+    # clone would lazily fetch them one commit at a time (unusably slow).
+    git clone --shallow-since="$(date -u -d '150 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-150d +%Y-%m-%d)" \
       https://github.com/PostHog/posthog.git "$REPO_DIR" || {
         echo "[boot] clone failed"; return 1; }
   fi
