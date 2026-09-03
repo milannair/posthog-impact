@@ -382,6 +382,26 @@ def main():
             "top_area": top_area,
         })
 
+    # The three pillars come from different unit systems (import sites vs. commits
+    # vs. reworked lines), so raw sums would let Leverage swamp the other two and
+    # Net would just be Leverage renamed. Put each pillar on a common footing:
+    # the 90th-percentile engineer scores 300 in every pillar. Ordering within a
+    # pillar is untouched — only the shared scale changes.
+    def scale_to(key, target=300.0):
+        vals = sorted(e[key] for e in engineers)
+        if not vals:
+            return 1.0
+        p90 = vals[min(int(0.9 * len(vals)), len(vals) - 1)]
+        return target / p90 if p90 > 0 else 1.0
+
+    factors = {k: scale_to(k) for k in ("leverage", "delivery", "drag")}
+    for e in engineers:
+        for k in ("leverage", "delivery", "drag"):
+            e[k + "_raw_points"] = e[k]
+            e[k] = round(e[k] * factors[k])
+        e["net"] = e["leverage"] + e["delivery"] - e["drag"]
+        e["drag100"] = round(100 * e["drag"] / e["commits"], 1) if e["commits"] else 0.0
+
     engineers.sort(key=lambda e: -e["net"])
 
     # Verdicts are generated from the same numbers shown on the card — never prose
@@ -445,6 +465,7 @@ def main():
              "delta": f"{DRAG_DAYS}d window", "good": False,
              "note": "reverts, hot-fixes, rewrites by others"},
         ],
+        "scale_factors": {k: round(v, 4) for k, v in factors.items()},
         "hotspots": hotspots,
         "engineers": engineers,
     }

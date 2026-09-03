@@ -217,9 +217,9 @@ function render(){
   document.getElementById("selVerdict").textContent=d.verdict;
 
   document.getElementById("selScores").innerHTML=[
-    ["Leverage",d.leverage,"#0972d3","√(import sites)×6 + distinct downstream authors×4 + load-bearing files×5 + √(CI/tooling commits)×6"],
-    ["Delivery",d.delivery,"#5f6b7a","√(commits)×8 + √(merged PRs)×7 + √(reviews given)×9 — square roots damp raw volume"],
-    ["Drag",d.drag,"#d13212",`rework-rate%×1.4 + follow-up fixes by others×2.5 + reverts×12, measured over ${D.drag_window_days} days`]
+    ["Leverage",d.leverage,"#0972d3",`√(${d.fan_in} import sites)×2.2 + ${d.dep_authors} downstream authors×6 + √(${d.adopted} adopted modules)×4 + ${d.load_bearing} load-bearing files×4 + √(${d.unblocking} CI/tooling commits)×6, then ×${D.scale_factors.leverage}`],
+    ["Delivery",d.delivery,"#5f6b7a",`√(${d.commits} commits)×8 + √(${d.prs} PRs)×7 + √(${d.reviews} reviews)×9 — square roots damp raw volume — then ×${D.scale_factors.delivery}`],
+    ["Drag",d.drag,"#d13212",`${d.rework_rate}% rework-rate×1.4 + ${d.hotfixes} follow-up fixes by others×2.5 + ${d.reverts} reverts×12 over ${D.drag_window_days} days, then ×${D.scale_factors.drag}`]
   ].map(([l,v,c,t])=>`<div style="padding:8px 12px;border-right:1px solid #e9ebed;display:flex;flex-direction:column;gap:1px">
       <span class="help" title="${esc(t)}" style="font-size:11px;color:#5f6b7a">${l}</span>
       <span class="mono" style="font-size:16px;font-weight:700;letter-spacing:-.02em;color:${c}">${v}</span></div>`).join("");
@@ -281,7 +281,8 @@ fetch("metrics.json?v="+Date.now()).then(r=>{if(!r.ok)throw new Error(r.status);
       <span style="display:flex;align-items:center;justify-content:flex-end;gap:6px"><i style="display:block;height:5px;background:#d13212;width:${(40*h.fixes/maxFix).toFixed(1)}px"></i><b style="font-weight:600">${h.fixes}</b></span>
       <span class="ell" style="color:#5f6b7a">${esc(h.author)}</span></div>`).join("");
   document.getElementById("foot").textContent=
-    `Ranked contributors need ≥${d.min_commits} commits in the window; bots excluded. Repo at ${d.head}.`;
+    `Each pillar is rescaled so the 90th-percentile engineer scores 300 in it, so the three are comparable `+
+    `(hover any pillar to see its full formula). Ranked contributors need ≥${d.min_commits} commits in the window; bots excluded. Repo at ${d.head}.`;
   document.getElementById("q").oninput=e=>{st.q=e.target.value;render();};
   document.getElementById("toggleRows").onclick=()=>{st.all=!st.all;render();};
   render();
