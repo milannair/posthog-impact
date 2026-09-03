@@ -25,6 +25,12 @@ cp /app/web/index.html "$SERVE_DIR/index.html"
 link_metrics() {
   [ -f "$METRICS_PATH" ] && cp -f "$METRICS_PATH" "$SERVE_DIR/metrics.json"
 }
+# A precomputed metrics.json ships in the image, so the dashboard has real data
+# the moment it deploys instead of waiting out the first-boot clone.
+if [ ! -f "$METRICS_PATH" ] && [ -f /app/web/metrics.json ]; then
+  echo "[boot] seeding metrics.json from image"
+  cp /app/web/metrics.json "$METRICS_PATH"
+fi
 link_metrics
 (cd "$SERVE_DIR" && python3 -m http.server "$PORT" --bind 0.0.0.0) &
 SERVER_PID=$!

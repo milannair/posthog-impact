@@ -130,9 +130,9 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
 
     <div style="font-size:11.5px;color:#879596;line-height:1.5">
       Net = leverage + delivery − drag.
-      <b style="color:#5f6b7a;font-weight:600">Leverage</b> credits abstractions others import and build on, weighted by distinct downstream authors.
+      <b style="color:#5f6b7a;font-weight:600">Leverage</b> credits files you created that others import and build on, weighted by import fan-in and by how many other engineers later extended them.
       <b style="color:#5f6b7a;font-weight:600">Delivery</b> is √-damped commits, pull requests and reviews.
-      <b style="color:#5f6b7a;font-weight:600">Drag</b> counts your lines reverted, hot-fixed, rewritten or deleted by others within 30 days of landing.
+      <b style="color:#5f6b7a;font-weight:600">Drag</b> counts your work reverted, deleted, hot-fixed or rewritten by others within 30 days of landing.
       <span id="foot"></span>
     </div>
   </div>
@@ -217,9 +217,14 @@ function render(){
   document.getElementById("selVerdict").textContent=d.verdict;
 
   document.getElementById("selScores").innerHTML=[
-    ["Leverage",d.leverage,"#0972d3",`√(${d.fan_in} import sites)×2.2 + ${d.dep_authors} downstream authors×6 + √(${d.adopted} adopted modules)×4 + ${d.load_bearing} load-bearing files×4 + √(${d.unblocking} CI/tooling commits)×6, then ×${D.scale_factors.leverage}`],
-    ["Delivery",d.delivery,"#5f6b7a",`√(${d.commits} commits)×8 + √(${d.prs} PRs)×7 + √(${d.reviews} reviews)×9 — square roots damp raw volume — then ×${D.scale_factors.delivery}`],
-    ["Drag",d.drag,"#d13212",`${d.rework_rate}% rework-rate×1.4 + ${d.hotfixes} follow-up fixes by others×2.5 + ${d.reverts} reverts×12 over ${D.drag_window_days} days, then ×${D.scale_factors.drag}`]
+    ["Leverage",d.leverage,"#0972d3",
+     `Per file they created: min(fan-in,40) if fan-in≥2, + 4 per later adopter, + 5 if in a shared layer; each file capped at 45. `+
+     `${d.adopted.toLocaleString()} files, ${d.fan_in.toLocaleString()} import sites, ${d.adopters} adoptions → raw ${d.leverage_raw.toLocaleString()}, then ^${D.damp} = ${d.leverage}.`],
+    ["Delivery",d.delivery,"#5f6b7a",
+     `6·√commits + 3·√PRs + 2.5·√reviews = 6·√${d.commits} + 3·√${d.prs} + 2.5·√${d.reviews} = ${d.delivery}. Square roots so raw volume can't dominate.`],
+    ["Drag",d.drag,"#d13212",
+     `Revert 15 · deletion-by-other 8 · hot-fix-by-other 4 · rewrite-by-other up to 13.3 · self-rewrite up to 10; max 2 events per file per type. `+
+     `${d.drag_events} events → raw ${d.drag_raw.toLocaleString()}, then ^${D.damp} = ${d.drag}.`]
   ].map(([l,v,c,t])=>`<div style="padding:8px 12px;border-right:1px solid #e9ebed;display:flex;flex-direction:column;gap:1px">
       <span class="help" title="${esc(t)}" style="font-size:11px;color:#5f6b7a">${l}</span>
       <span class="mono" style="font-size:16px;font-weight:700;letter-spacing:-.02em;color:${c}">${v}</span></div>`).join("");
@@ -228,7 +233,7 @@ function render(){
     ["Commits",d.commits.toLocaleString(),"Non-merge commits authored in the window."],
     ["PRs merged",d.prs.toLocaleString(),"Pull requests they authored that merged in the window."],
     ["Reviews given",d.reviews,"Reviews submitted on other people's PRs."],
-    ["Downstream authors",d.dep_authors,"Distinct other engineers whose files import modules this person owns."],
+    ["Files adopted",d.adopted.toLocaleString(),"Files they created in the window that have import fan-in or were later modified by someone else."],
     ["Rework rate",d.rework_rate+"%",`% of the ${d.lines_landed.toLocaleString()} lines they landed that others deleted or rewrote within ${D.drag_window_days} days.`],
     ["Drag / 100 commits",d.drag100.toFixed(1),"Drag normalised for volume."]
   ].map(([l,v,t])=>`<div style="padding:7px 12px;display:flex;flex-direction:column">
@@ -281,8 +286,9 @@ fetch("metrics.json?v="+Date.now()).then(r=>{if(!r.ok)throw new Error(r.status);
       <span style="display:flex;align-items:center;justify-content:flex-end;gap:6px"><i style="display:block;height:5px;background:#d13212;width:${(40*h.fixes/maxFix).toFixed(1)}px"></i><b style="font-weight:600">${h.fixes}</b></span>
       <span class="ell" style="color:#5f6b7a">${esc(h.author)}</span></div>`).join("");
   document.getElementById("foot").textContent=
-    `Each pillar is rescaled so the 90th-percentile engineer scores 300 in it, so the three are comparable `+
-    `(hover any pillar to see its full formula). Ranked contributors need ≥${d.min_commits} commits in the window; bots excluded. Repo at ${d.head}.`;
+    `net = leverage^${d.damp} + delivery − drag^${d.damp}; the exponent gives diminishing returns so file count alone can't dominate. `+
+    `Bots, generated files, tests and bulk commits (>60 files) are excluded; ranked contributors need ≥${d.min_commits} commits. `+
+    `Hover any pillar or stat for its exact formula. Repo at ${d.head}.`;
   document.getElementById("q").oninput=e=>{st.q=e.target.value;render();};
   document.getElementById("toggleRows").onclick=()=>{st.all=!st.all;render();};
   render();

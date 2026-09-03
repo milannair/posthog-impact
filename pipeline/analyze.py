@@ -1,17 +1,13 @@
-"""Compute engineer impact metrics for the PostHog repo.
+"""Engineer impact for PostHog/posthog.
 
-Net = Leverage + Delivery - Drag
+    net = leverage^0.75 + delivery - drag^0.75
 
-  Leverage  abstractions other people import and build on, weighted by the number
-            of *distinct downstream authors* (one person importing their own module
-            is not leverage).
-  Delivery  sqrt-damped commits, merged PRs and reviews given, so raw volume has
-            sharply diminishing returns.
-  Drag      lines of theirs reverted, hot-fixed, rewritten or deleted by someone
-            else within 30 days of landing.
+The 0.75 exponent on both sides gives diminishing returns, so an engineer with
+thousands of files cannot dominate on count alone.
 
-Every number written here carries the evidence that produced it, so the dashboard
-can always show what went into a score.
+Computed over the last 90 days of the default branch, excluding bots, generated
+files, tests, and bulk commits touching more than 60 files. Every number written
+here carries the evidence that produced it.
 """
 
 import json
@@ -26,109 +22,95 @@ from datetime import datetime, timedelta, timezone
 REPO = os.environ.get("REPO_DIR", "/data/repo")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/data/cache")
 OUT = os.environ.get("METRICS_PATH", "/data/metrics.json")
+
 SCORE_DAYS = 90
 DRAG_DAYS = 30
-MIN_COMMITS = 8  # impact floor — below this the sample is too small to rank
+HOTFIX_DAYS = 14
+BULK_FILES = 60      # commits above this are migrations/renames, not authorship
+MIN_COMMITS = 8      # impact floor
+DAMP = 0.75
 
 BOT_PAT = re.compile(
     r"(\[bot\]|dependabot|renovate|github-actions|posthog-bot|snyk|codecov|"
-    r"sentry-io|greenkeeper|imgbot|-bot$|^bot$)",
-    re.I,
-)
+    r"sentry-io|greenkeeper|imgbot|-bot$|^bot$|^posthog$)", re.I)
 CODE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs")
-SCOPES = ("posthog/", "frontend/src/", "plugin-server/src/", "products/", "ee/", "common/", "rust/")
-INFRA_PAT = re.compile(
-    r"(^\.github/|^bin/|Dockerfile|^ci/|conftest\.py$|jest\.config|playwright|"
-    r"^\.pre-commit|pyproject\.toml$|tsconfig|webpack|vite\.config|Makefile$)",
-    re.I,
-)
-FIX_PAT = re.compile(r"\b(fix|hotfix|revert|patch|repair|broke|broken|regression)\b", re.I)
+SCOPES = ("posthog/", "frontend/src/", "plugin-server/src/", "products/", "ee/",
+          "common/", "rust/")
+GENERATED_PAT = re.compile(
+    r"(\.min\.|/migrations/|/__snapshots__/|\.snap$|/generated/|_pb2\.py$|"
+    r"\.generated\.|/vendor/|\.lock$|schema\.py$|/dist/|/node_modules/)", re.I)
+TEST_PAT = re.compile(r"(^|/)(tests?|__tests__|e2e|cypress|spec)(/|$)|"
+                      r"(test_[^/]+|[^/]+_test|[^/]+\.(test|spec))\.[a-z]+$", re.I)
+SHARED_LAYER = re.compile(
+    r"(^|/)(lib|common|hooks|models|core|utils|api|schema|providers)(/|$)")
+FIX_PAT = re.compile(r"\b(fix|bug|regression)\b", re.I)
+REFACTOR_PAT = re.compile(r"\b(refactor|cleanup|clean-up|simplify)\b", re.I)
+PR_REF = re.compile(r"\(#(\d+)\)\s*$")
 
 now = datetime.now(timezone.utc)
 score_cutoff = now - timedelta(days=SCORE_DAYS)
 prev_cutoff = now - timedelta(days=2 * SCORE_DAYS)
 
 
-def git(*args):
-    return subprocess.run(
-        ["git", "-C", REPO, *args], capture_output=True, text=True, errors="replace"
-    ).stdout
+def git(*a):
+    return subprocess.run(["git", "-C", REPO, *a], capture_output=True,
+                          text=True, errors="replace").stdout
 
 
 def parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def interesting(path):
+    return (path.endswith(CODE_EXT) and path.startswith(SCOPES)
+            and not GENERATED_PAT.search(path) and not TEST_PAT.search(path))
+
+
 def load_commits():
     sep = "\x1e"
-    raw = git(
-        "log", "--no-merges", f"--since={(now - timedelta(days=185)).date()}",
-        f"--pretty=format:{sep}%H%x1f%an%x1f%ae%x1f%aI%x1f%s", "--numstat",
-    )
-    commits = []
+    raw = git("log", "--no-merges", f"--since={(now - timedelta(days=185)).date()}",
+              f"--pretty=format:{sep}%H%x1f%an%x1f%ae%x1f%aI%x1f%s", "--numstat")
+    out = []
     for block in raw.split(sep):
         block = block.strip("\n")
         if not block:
             continue
         head, *rest = block.split("\n")
-        parts = head.split("\x1f")
-        if len(parts) < 5:
+        p = head.split("\x1f")
+        if len(p) < 5:
             continue
-        sha, name, email, date, subject = parts[:5]
-        files = [
-            {"add": int(c[0]), "del": int(c[1]), "path": c[2]}
-            for c in (l.split("\t") for l in rest)
-            if len(c) == 3 and c[0] != "-"
-        ]
-        commits.append({"sha": sha, "name": name, "email": email,
-                        "date": parse_ts(date), "subject": subject, "files": files})
-    return commits
-
-
-PR_REF = re.compile(r"\(#(\d+)\)\s*$")
+        sha, name, email, date, subject = p[:5]
+        all_files = [c for c in (l.split("\t") for l in rest) if len(c) == 3 and c[0] != "-"]
+        bulk = len(all_files) > BULK_FILES
+        files = [{"add": int(c[0]), "del": int(c[1]), "path": c[2]}
+                 for c in all_files if interesting(c[2])]
+        out.append({"sha": sha, "name": name, "email": email, "date": parse_ts(date),
+                    "subject": subject, "files": files, "bulk": bulk,
+                    "nfiles": len(all_files)})
+    return out
 
 
 def build_identity(prs, commits):
-    """Resolve a commit to a GitHub login.
-
-    PostHog squash-merges, so a commit subject ends in "(#12345)" — that maps a
-    commit to its PR and therefore to the PR author's login exactly. Everything
-    else (noreply emails, display-name matching) is a fallback.
-    """
-    logins = {}
-    for p in prs:
-        a = (p.get("author") or {}).get("login")
-        if a:
-            logins[a.lower()] = a
-    pr_author = {
-        p["number"]: p["author"]["login"] for p in prs if p.get("author")
-    }
-
-    # A commit whose subject carries a PR number teaches us that this git
-    # identity (email) belongs to that PR's author.
-    email_to_login = {}
-    name_to_login = {}
+    """GitHub PR author via the `(#1234)` squash-merge ref, falling back to email."""
+    pr_author = {p["number"]: p["author"]["login"] for p in prs if p.get("author")}
+    logins = {l.lower(): l for l in pr_author.values()}
+    by_email, by_name = {}, {}
     for c in commits:
         m = PR_REF.search(c["subject"])
-        if m:
-            login = pr_author.get(int(m.group(1)))
-            if login:
-                email_to_login.setdefault(c["email"], login)
-                name_to_login.setdefault(c["name"], login)
+        if m and pr_author.get(int(m.group(1))):
+            by_email.setdefault(c["email"], pr_author[int(m.group(1))])
+            by_name.setdefault(c["name"], pr_author[int(m.group(1))])
     for c in commits:
         m = re.match(r"^(?:\d+\+)?([\w.-]+)@users\.noreply\.github\.com$", c["email"])
         if m:
-            email_to_login.setdefault(c["email"], logins.get(m.group(1).lower(), m.group(1)))
+            by_email.setdefault(c["email"], logins.get(m.group(1).lower(), m.group(1)))
 
     def resolve(c):
         m = PR_REF.search(c["subject"])
         if m and pr_author.get(int(m.group(1))):
             return pr_author[int(m.group(1))]
-        if c["email"] in email_to_login:
-            return email_to_login[c["email"]]
-        if c["name"] in name_to_login:
-            return name_to_login[c["name"]]
-        return logins.get(c["name"].lower().replace(" ", ""), c["name"])
+        return (by_email.get(c["email"]) or by_name.get(c["name"])
+                or logins.get(c["name"].lower().replace(" ", ""), c["name"]))
 
     return resolve
 
@@ -137,8 +119,13 @@ IMPORT_PY = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re
 IMPORT_TS = re.compile(r"""(?:from|import\()\s*['"]([^'"]+)['"]""", re.M)
 
 
-def build_import_graph(files):
-    importers = defaultdict(set)
+def build_fan_in(files):
+    """Count import statements at HEAD referencing each module.
+
+    Specifiers are matched on *trailing path segments*, so `foo/types` never
+    matches `bar/types`.
+    """
+    refs = defaultdict(int)
     for path in files:
         try:
             with open(os.path.join(REPO, path), "r", errors="replace") as f:
@@ -146,30 +133,29 @@ def build_import_graph(files):
         except OSError:
             continue
         if path.endswith(".py"):
-            for a, b in IMPORT_PY.findall(src):
-                importers[(a or b).replace(".", "/")].add(path)
+            specs = [(a or b).replace(".", "/") for a, b in IMPORT_PY.findall(src)]
         else:
-            for spec in IMPORT_TS.findall(src):
-                base = (
-                    os.path.normpath(os.path.join(os.path.dirname(path), spec))
-                    if spec.startswith(".")
-                    else spec.lstrip("~@/")
-                )
-                importers[base].add(path)
-    return importers
+            specs = [
+                os.path.normpath(os.path.join(os.path.dirname(path), s))
+                if s.startswith(".") else s.lstrip("~@/")
+                for s in IMPORT_TS.findall(src)
+            ]
+        for s in specs:
+            refs[s.strip("/")] += 1
+    return refs
 
 
-def file_keys(path):
+def fan_in_for(path, refs):
     stem = re.sub(r"\.(py|tsx?|jsx?)$", "", path)
-    keys = {stem}
-    for suffix in ("/index", "/__init__"):
-        if stem.endswith(suffix):
-            keys.add(stem[: -len(suffix)])
+    cands = {stem}
+    for suf in ("/index", "/__init__"):
+        if stem.endswith(suf):
+            cands.add(stem[: -len(suf)])
     segs = stem.split("/")
-    for n in (2, 3):
+    for n in (2, 3, 4):
         if len(segs) >= n:
-            keys.add("/".join(segs[-n:]))
-    return keys
+            cands.add("/".join(segs[-n:]))
+    return sum(refs.get(c, 0) for c in cands)
 
 
 def main():
@@ -182,6 +168,7 @@ def main():
     for c in commits:
         c["login"] = resolve(c)
         c["is_fix"] = bool(FIX_PAT.search(c["subject"]))
+        c["is_refactor"] = bool(REFACTOR_PAT.search(c["subject"]))
     commits = [c for c in commits if not BOT_PAT.search(c["login"])]
     commits.sort(key=lambda c: c["date"])
     print(f"loaded {len(commits)} commits, {len(prs)} PRs", file=sys.stderr)
@@ -190,284 +177,250 @@ def main():
     prev = [c for c in commits if prev_cutoff <= c["date"] < score_cutoff]
     win_prs = [p for p in prs if parse_ts(p["mergedAt"]) >= score_cutoff]
     prev_prs = [p for p in prs if prev_cutoff <= parse_ts(p["mergedAt"]) < score_cutoff]
-
     contributors = {c["login"] for c in window} | {p["author"]["login"] for p in win_prs}
 
     S = defaultdict(lambda: defaultdict(float))
-    abs_ev = defaultdict(list)      # adopted abstractions
-    rework_ev = defaultdict(list)   # rework/drag events
+    abs_ev, drag_ev = defaultdict(list), defaultdict(list)
     area_ct = defaultdict(lambda: defaultdict(int))
 
     for c in window:
         S[c["login"]]["commits"] += 1
-        trees = {"/".join(f["path"].split("/")[:2]) for f in c["files"] if "/" in f["path"]}
-        for t in trees:
+        for t in {"/".join(f["path"].split("/")[:2]) for f in c["files"] if "/" in f["path"]}:
             area_ct[c["login"]][t] += 1
-        if any(INFRA_PAT.search(f["path"]) for f in c["files"]):
-            S[c["login"]]["unblocking"] += 1
-
     for p in win_prs:
         S[p["author"]["login"]]["prs"] += 1
     for p in win_prs:
-        author = p["author"]["login"]
         seen = set()
         for r in (p.get("reviews") or {}).get("nodes", []):
-            rl = ((r.get("author") or {}).get("login"))
-            if not rl or rl == author or rl in seen or BOT_PAT.search(rl):
-                continue
-            seen.add(rl)
-            S[rl]["reviews"] += 1
+            rl = (r.get("author") or {}).get("login")
+            if rl and rl != p["author"]["login"] and rl not in seen and not BOT_PAT.search(rl):
+                seen.add(rl)
+                S[rl]["reviews"] += 1
 
-    # ---------------- LEVERAGE: who builds on whose code ----------------
-    tracked = [
-        p for p in git("ls-files").splitlines()
-        if p.endswith(CODE_EXT) and p.startswith(SCOPES)
-    ]
-    print(f"import graph over {len(tracked)} files", file=sys.stderr)
-    importers = build_import_graph(tracked)
-
-    file_lines = defaultdict(lambda: defaultdict(int))
+    # ---------- file creation / modification history ----------
+    created_by, created_at = {}, {}
+    modifiers = defaultdict(set)
+    deleted_by = {}
     for c in commits:
+        if c["bulk"]:
+            continue
         for f in c["files"]:
-            file_lines[f["path"]][c["login"]] += f["add"]
+            p = f["path"]
+            modifiers[p].add(c["login"])
+            if p not in created_by and f["del"] == 0 and f["add"] > 0:
+                created_by[p], created_at[p] = c["login"], c["date"]
 
+    tracked = [p for p in git("ls-files").splitlines() if interesting(p)]
+    tracked_set = set(tracked)
+    print(f"fan-in over {len(tracked)} files", file=sys.stderr)
+    refs = build_fan_in(tracked)
+
+    # ---------- LEVERAGE ----------
     adopted_total = 0
-    downstream = defaultdict(set)    # login -> distinct other engineers building on them
-    owned_adopted = defaultdict(set)  # login -> their modules that anyone imports
-    for path in tracked:
-        authors = file_lines.get(path)
-        if not authors:
+    for path, owner in created_by.items():
+        if created_at[path] < score_cutoff or owner not in contributors:
             continue
-        owner = max(authors, key=authors.get)
-        if owner not in contributors:
+        if path not in tracked_set:
             continue
-        deps = set()
-        for k in file_keys(path):
-            deps |= importers.get(k, set())
-        deps.discard(path)
-        if not deps:
+        fi = fan_in_for(path, refs)
+        adopters = len(modifiers[path] - {owner})
+        score = 0.0
+        if fi >= 2:
+            score += min(fi, 40) * 1.0
+        score += adopters * 4.0
+        if SHARED_LAYER.search(path) and (fi >= 2 or adopters > 0):
+            score += 5.0
+        score = min(score, 45.0)
+        if score <= 0:
             continue
-        dep_authors = set()
-        for d in deps:
-            da = file_lines.get(d)
-            if da:
-                dep_authors.add(max(da, key=da.get))
-        dep_authors.discard(owner)
-
-        # Leverage credits fan-in, but pays far more for *other people* adopting it.
-        # Downstream authors are unioned across all of an owner's files — the same
-        # colleague importing ten of their modules is one adopter, not ten.
-        S[owner]["fan_in"] += len(deps)
-        downstream[owner] |= dep_authors
-        owned_adopted[owner].add(path)
-        if len(dep_authors) >= 2:
+        S[owner]["leverage_raw"] += score
+        S[owner]["files_adopted"] += 1
+        S[owner]["fan_in"] += fi
+        S[owner]["adopters"] += adopters
+        if adopters >= 2:
             adopted_total += 1
-        share = authors[owner] / max(sum(authors.values()), 1)
-        if share > 0.6 and len(deps) >= 5:
-            S[owner]["load_bearing"] += 1
-        pts = round(math.sqrt(len(deps)) * 1.6 + len(dep_authors) * 3.0)
-        if pts >= 4:
-            others = sorted(dep_authors)[:3]
+        if score >= 8:
             abs_ev[owner].append({
-                "path": path, "delta": f"+{pts}", "sort": pts,
-                "note": f"fan-in {len(deps)} · "
-                        + (f"extended by {', '.join(others)}"
-                           + (f" +{len(dep_authors) - 3}" if len(dep_authors) > 3 else "")
-                           if others else "no other authors yet"),
+                "path": path, "delta": f"+{score:.0f}", "sort": score,
+                "note": f"fan-in {fi} · "
+                        + (f"extended by {adopters} other engineer"
+                           + ("s" if adopters != 1 else "")
+                           if adopters else "no other authors yet")
+                        + (" · shared layer" if SHARED_LAYER.search(path) else ""),
             })
 
-    # ---------------- DRAG ----------------
-    by_subject = defaultdict(list)
+    # ---------- DRAG ----------
+    per_file_type = defaultdict(int)  # (login, path, kind) -> count, capped at 2
+
+    def add_drag(login, path, kind, points, note, delta):
+        key = (login, path, kind)
+        if per_file_type[key] >= 2:
+            return
+        per_file_type[key] += 1
+        S[login]["drag_raw"] += points
+        S[login]["drag_events"] += 1
+        S[login][kind] += 1
+        drag_ev[login].append({"path": path, "delta": delta, "sort": points, "note": note})
+
+    # Reverts: a commit starting with "Revert" naming the engineer's PR.
+    pr_author = {p["number"]: p["author"]["login"] for p in prs if p.get("author")}
     for c in commits:
-        by_subject[c["subject"]].append(c)
-    revert_re = re.compile(r'Revert\s+"(.+?)"')
-    for c in commits:
-        m = revert_re.search(c["subject"])
-        if not m:
+        if c["date"] < score_cutoff or not c["subject"].lower().startswith("revert"):
             continue
-        for orig in by_subject.get(m.group(1), []):
-            if orig["date"] < c["date"] and orig["date"] >= score_cutoff:
-                S[orig["login"]]["reverts"] += 1
-                rework_ev[orig["login"]].append({
-                    "path": orig["files"][0]["path"] if orig["files"] else orig["subject"],
-                    "delta": "revert", "sort": 40,
-                    "note": f"{c['login']} · {c['date'].date()} · {c['subject'][:78]}",
-                })
+        for num in re.findall(r"#(\d+)", c["subject"]):
+            victim = pr_author.get(int(num))
+            if victim and victim != c["login"]:
+                add_drag(victim, f"PR #{num}", "reverts", 15,
+                         f"{c['login']} · {c['date'].date()} · {c['subject'][:78]}",
+                         "revert")
+                break
+
+    # Deletions of a file its creator made, by someone else, within 30 days.
+    for c in commits:
+        if c["bulk"] or c["date"] < score_cutoff:
+            continue
+        for f in c["files"]:
+            p = f["path"]
+            if f["add"] == 0 and f["del"] > 0 and p not in tracked_set:
+                owner = created_by.get(p)
+                if (owner and owner != c["login"] and created_at.get(p)
+                        and c["date"] - created_at[p] <= timedelta(days=DRAG_DAYS)):
+                    add_drag(owner, p, "deleted", 8,
+                             f"{c['login']} · {c['date'].date()} · deleted · {c['subject'][:60]}",
+                             "deleted")
 
     touches = defaultdict(list)
     for c in commits:
-        for f in c["files"]:
-            touches[f["path"]].append((c, f))
+        if not c["bulk"]:
+            for f in c["files"]:
+                touches[f["path"]].append((c, f))
 
-    drag_events = 0
     for path, seq in touches.items():
         for i, (c, f) in enumerate(seq):
-            if c["date"] < score_cutoff or f["add"] == 0:
+            if c["date"] < score_cutoff or f["add"] < 20:
                 continue
             login = c["login"]
             S[login]["lines_landed"] += f["add"]
-            end = c["date"] + timedelta(days=DRAG_DAYS)
             for c2, f2 in seq[i + 1:]:
-                if c2["date"] > end:
+                age = c2["date"] - c["date"]
+                if age > timedelta(days=DRAG_DAYS):
                     break
-                if c2["login"] == login or f2["del"] == 0:
+                if f2["del"] == 0:
                     continue
-                killed = min(f2["del"], f["add"])
-                S[login]["lines_reworked"] += killed
-                if c2["is_fix"] and killed >= 5:
-                    S[login]["hotfixes"] += 1
-                    drag_events += 1
-                    rework_ev[login].append({
-                        "path": path, "delta": f"−{killed}", "sort": killed,
-                        "note": f"{c2['login']} · {c2['date'].date()} · {c2['subject'][:78]}",
-                    })
-                    break
+                other = c2["login"] != login
+                if (other and c2["is_fix"] and not c2["is_refactor"]
+                        and age <= timedelta(days=HOTFIX_DAYS)):
+                    add_drag(login, path, "hotfixed", 4,
+                             f"{c2['login']} · {c2['date'].date()} · {c2['subject'][:70]}",
+                             "hot-fix")
+                if other and f2["del"] >= 0.6 * f["add"]:
+                    pts = min(min(f2["del"], 400) / 30.0, 13.3)
+                    S[login]["lines_reworked"] += min(f2["del"], f["add"])
+                    add_drag(login, path, "rewritten", pts,
+                             f"{c2['login']} · {c2['date'].date()} · {c2['subject'][:70]}",
+                             f"−{int(f2['del'])}")
+                if not other and f2["del"] >= 0.5 * f["add"]:
+                    pts = min(min(f2["del"], 400) / 40.0, 10.0)
+                    add_drag(login, path, "self_rewrite", pts,
+                             f"self · {c2['date'].date()} · {c2['subject'][:70]}",
+                             f"−{int(f2['del'])}")
 
-    # ---------------- hotspots ----------------
-    fix_by_file = defaultdict(int)
-    top_author = defaultdict(lambda: defaultdict(int))
+    # ---------- hotspots ----------
+    fix_by_file, top_author = defaultdict(int), defaultdict(lambda: defaultdict(int))
     for c in window:
+        if c["bulk"]:
+            continue
         for f in c["files"]:
             top_author[f["path"]][c["login"]] += 1
             if c["is_fix"]:
                 fix_by_file[f["path"]] += 1
-    hotspots = [
-        {"path": p, "fixes": n,
-         "author": max(top_author[p], key=top_author[p].get) if top_author.get(p) else "—"}
-        for p, n in sorted(fix_by_file.items(), key=lambda kv: -kv[1])[:6]
-    ]
+    hotspots = [{"path": p, "fixes": n,
+                 "author": max(top_author[p], key=top_author[p].get)}
+                for p, n in sorted(fix_by_file.items(), key=lambda kv: -kv[1])[:6]]
 
-    # ---------------- scores ----------------
+    # ---------- scores ----------
     engineers = []
     for login in contributors:
         s = S[login]
         if s["commits"] < MIN_COMMITS:
             continue
-        dep_authors = len(downstream[login])
-        leverage = round(math.sqrt(s["fan_in"]) * 2.2 + dep_authors * 6
-                         + math.sqrt(len(owned_adopted[login])) * 4
-                         + s["load_bearing"] * 4 + math.sqrt(s["unblocking"]) * 6)
-        delivery = round(math.sqrt(s["commits"]) * 8 + math.sqrt(s["prs"]) * 7
-                         + math.sqrt(s["reviews"]) * 9)
-        landed = s["lines_landed"]
-        rework_rate = 100 * min(s["lines_reworked"], landed) / landed if landed else 0.0
-        drag = round(rework_rate * 1.4 + s["hotfixes"] * 2.5 + s["reverts"] * 12)
-
+        leverage = round(s["leverage_raw"] ** DAMP)
+        delivery = round(6 * math.sqrt(s["commits"]) + 3 * math.sqrt(s["prs"])
+                         + 2.5 * math.sqrt(s["reviews"]))
+        drag = round(s["drag_raw"] ** DAMP)
         areas = sorted(area_ct[login].items(), key=lambda kv: -kv[1])[:5]
-        abs_list = sorted(abs_ev[login], key=lambda e: -e["sort"])[:6]
-        rw_list = sorted(rework_ev[login], key=lambda e: -e["sort"])[:6]
-
-        top_area = areas[0][0] if areas else "—"
+        landed = s["lines_landed"]
         engineers.append({
             "login": login,
             "subtitle": " · ".join(a for a, _ in areas[:3]) or "—",
             "leverage": leverage, "delivery": delivery, "drag": drag,
             "net": leverage + delivery - drag,
-            "commits": int(s["commits"]), "prs": int(s["prs"]),
-            "reviews": int(s["reviews"]),
-            "adopted": len(owned_adopted[login]),
-            "dep_authors": dep_authors,
-            "fan_in": int(s["fan_in"]),
-            "load_bearing": int(s["load_bearing"]),
-            "unblocking": int(s["unblocking"]),
-            "reverts": int(s["reverts"]),
-            "hotfixes": int(s["hotfixes"]),
+            "leverage_raw": round(s["leverage_raw"]), "drag_raw": round(s["drag_raw"]),
+            "commits": int(s["commits"]), "prs": int(s["prs"]), "reviews": int(s["reviews"]),
+            "adopted": int(s["files_adopted"]), "fan_in": int(s["fan_in"]),
+            "adopters": int(s["adopters"]), "drag_events": int(s["drag_events"]),
+            "reverts": int(s["reverts"]), "deleted": int(s["deleted"]),
+            "hotfixed": int(s["hotfixed"]), "rewritten": int(s["rewritten"]),
+            "self_rewrite": int(s["self_rewrite"]),
             "lines_landed": int(landed),
-            "rework_rate": round(rework_rate, 1),
+            "rework_rate": round(100 * min(s["lines_reworked"], landed) / landed, 1) if landed else 0.0,
             "drag100": round(100 * drag / s["commits"], 1),
-            "abs": [{k: v for k, v in e.items() if k != "sort"} for e in abs_list],
-            "rework": [{k: v for k, v in e.items() if k != "sort"} for e in rw_list],
+            "abs": [{k: v for k, v in e.items() if k != "sort"}
+                    for e in sorted(abs_ev[login], key=lambda e: -e["sort"])[:6]],
+            "rework": [{k: v for k, v in e.items() if k != "sort"}
+                       for e in sorted(drag_ev[login], key=lambda e: -e["sort"])[:6]],
             "areas": [{"path": a, "delta": str(n), "note": "commits touching this tree"}
                       for a, n in areas],
-            "top_area": top_area,
+            "top_area": areas[0][0] if areas else "—",
         })
-
-    # The three pillars come from different unit systems (import sites vs. commits
-    # vs. reworked lines), so raw sums would let Leverage swamp the other two and
-    # Net would just be Leverage renamed. Put each pillar on a common footing:
-    # the 90th-percentile engineer scores 300 in every pillar. Ordering within a
-    # pillar is untouched — only the shared scale changes.
-    def scale_to(key, target=300.0):
-        vals = sorted(e[key] for e in engineers)
-        if not vals:
-            return 1.0
-        p90 = vals[min(int(0.9 * len(vals)), len(vals) - 1)]
-        return target / p90 if p90 > 0 else 1.0
-
-    factors = {k: scale_to(k) for k in ("leverage", "delivery", "drag")}
-    for e in engineers:
-        for k in ("leverage", "delivery", "drag"):
-            e[k + "_raw_points"] = e[k]
-            e[k] = round(e[k] * factors[k])
-        e["net"] = e["leverage"] + e["delivery"] - e["drag"]
-        e["drag100"] = round(100 * e["drag"] / e["commits"], 1) if e["commits"] else 0.0
 
     engineers.sort(key=lambda e: -e["net"])
 
-    # Verdicts are generated from the same numbers shown on the card — never prose
-    # that isn't backed by a metric on screen.
     for i, e in enumerate(engineers):
-        bits = []
-        if e["dep_authors"]:
-            bits.append(
-                f"{e['dep_authors']} other engineers build on code they own "
-                f"({e['fan_in']} import sites across {e['adopted']} modules)"
-            )
+        parts = [
+            f"Raw leverage {e['leverage_raw']:,} across {e['adopted']:,} files they created "
+            f"({e['fan_in']:,} import sites, {e['adopters']} later modifications by others) "
+            f"→ {e['leverage']} after damping",
+            f"delivery {e['delivery']} from {e['commits']:,} commits, {e['prs']:,} PRs and "
+            f"{e['reviews']} reviews",
+        ]
+        if e["drag_raw"]:
+            kinds = [f"{e[k]} {n}" for k, n in
+                     (("reverts", "reverts"), ("deleted", "deletions"),
+                      ("hotfixed", "hot-fixes"), ("rewritten", "rewrites by others"),
+                      ("self_rewrite", "self-rewrites")) if e[k]]
+            parts.append(f"raw drag {e['drag_raw']:,} across {e['drag_events']} events "
+                         f"({', '.join(kinds)}) → {e['drag']} after damping")
         else:
-            bits.append("no cross-author adoption of their modules in this window")
-        bits.append(
-            f"delivery is {e['commits']} commits, {e['prs']} merged PRs and "
-            f"{e['reviews']} reviews given"
-        )
-        if e["drag"]:
-            d = [f"{e['rework_rate']}% of their landed lines were reworked by others "
-                 f"within {DRAG_DAYS} days"]
-            if e["hotfixes"]:
-                d.append(f"{e['hotfixes']} follow-up fixes by colleagues")
-            if e["reverts"]:
-                d.append(f"{e['reverts']} reverts")
-            bits.append("drag: " + ", ".join(d))
-        else:
-            bits.append("no measurable drag in this window")
-        if e["load_bearing"]:
-            bits.append(f"{e['load_bearing']} load-bearing files they dominantly authored")
-        if e["unblocking"]:
-            bits.append(f"{e['unblocking']} commits to CI/build/test tooling")
-        e["verdict"] = f"Rank {i + 1} by net impact, mostly in {e['top_area']}. " \
-                       + "; ".join(bits).capitalize() + "."
+            parts.append("no drag events in this window")
+        e["verdict"] = (f"Rank {i + 1} by net impact, mostly in {e['top_area']}. "
+                        + "; ".join(parts)
+                        + f". Net = {e['leverage']} + {e['delivery']} − {e['drag']} = {e['net']}.")
 
     def pct(a, b):
-        if not b:
-            return "—"
-        return f"{'+' if a >= b else ''}{round(100 * (a - b) / b)}%"
+        return "—" if not b else f"{'+' if a >= b else ''}{round(100 * (a - b) / b)}%"
 
     payload = {
-        "generated_at": now.isoformat(),
-        "repo": "PostHog/posthog",
-        "window_days": SCORE_DAYS,
-        "drag_window_days": DRAG_DAYS,
-        "min_commits": MIN_COMMITS,
+        "generated_at": now.isoformat(), "repo": "PostHog/posthog",
+        "window_days": SCORE_DAYS, "drag_window_days": DRAG_DAYS,
+        "hotfix_window_days": HOTFIX_DAYS, "min_commits": MIN_COMMITS, "damp": DAMP,
         "head": git("log", "-1", "--format=%h %cI").strip(),
         "kpis": [
-            {"label": "Commits", "value": len(window),
-             "delta": pct(len(window), len(prev)), "good": len(window) >= len(prev),
-             "note": "vs. prior 90 days"},
+            {"label": "Commits", "value": len(window), "delta": pct(len(window), len(prev)),
+             "good": len(window) >= len(prev), "note": "vs. prior 90 days"},
             {"label": "Pull requests merged", "value": len(win_prs),
-             "delta": pct(len(win_prs), len(prev_prs)), "good": len(win_prs) >= len(prev_prs),
-             "note": "authored by humans"},
+             "delta": pct(len(win_prs), len(prev_prs)),
+             "good": len(win_prs) >= len(prev_prs), "note": "authored by humans"},
             {"label": "Contributors", "value": len(contributors),
              "delta": f"{len(engineers)} ranked", "good": True,
              "note": f"≥{MIN_COMMITS} commits to be ranked"},
-            {"label": "Abstractions adopted", "value": adopted_total,
-             "delta": "2+ authors", "good": True,
-             "note": "modules imported by 2+ other authors"},
-            {"label": "Drag events", "value": drag_events,
+            {"label": "Abstractions adopted", "value": adopted_total, "delta": "2+ authors",
+             "good": True, "note": "new files later modified by 2+ others"},
+            {"label": "Drag events", "value": sum(e["drag_events"] for e in engineers),
              "delta": f"{DRAG_DAYS}d window", "good": False,
-             "note": "reverts, hot-fixes, rewrites by others"},
+             "note": "reverts, deletions, hot-fixes, rewrites"},
         ],
-        "scale_factors": {k: round(v, 4) for k, v in factors.items()},
-        "hotspots": hotspots,
-        "engineers": engineers,
+        "hotspots": hotspots, "engineers": engineers,
     }
     os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
     with open(OUT, "w") as f:
