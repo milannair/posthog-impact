@@ -28,6 +28,9 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
 .ell{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rtl{direction:rtl;text-align:left}
 .help{cursor:help;border-bottom:1px dotted #aab7b8}
+summary::-webkit-details-marker{display:none}
+#methodology summary:hover{background:#f6f9fc}
+#methBody p b{color:#16191f;font-weight:600}
 </style>
 </head>
 <body>
@@ -133,13 +136,14 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
       </div>
     </div>
 
-    <div style="font-size:11.5px;color:#879596;line-height:1.5">
-      Net = leverage + delivery − drag.
-      <b style="color:#5f6b7a;font-weight:600">Leverage</b> credits files you created that others import and build on, weighted by import fan-in and by how many other engineers later extended them.
-      <b style="color:#5f6b7a;font-weight:600">Delivery</b> is √-damped commits, pull requests and reviews.
-      <b style="color:#5f6b7a;font-weight:600">Drag</b> counts your work reverted, deleted, hot-fixed or rewritten by others within 30 days of landing.
-      <span id="foot"></span>
-    </div>
+    <details class="card" id="methodology" style="flex:none">
+      <summary style="display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;list-style:none">
+        <span id="methChev" style="color:#5f6b7a;font-size:11px;width:9px">▸</span>
+        <h2 style="margin:0;font-size:15px;font-weight:700;letter-spacing:-.01em">How these scores are calculated</h2>
+        <span class="sub" style="margin-left:2px">net = leverage<sup>0.75</sup> + delivery − drag<sup>0.75</sup></span>
+      </summary>
+      <div id="methBody" style="border-top:1px solid #e9ebed;padding:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;font-size:12px;line-height:1.55;color:#414d5c"></div>
+    </details>
   </div>
 </div>
 
@@ -290,10 +294,42 @@ fetch("metrics.json?v="+Date.now()).then(r=>{if(!r.ok)throw new Error(r.status);
       <span class="ell rtl">${esc(h.path)}</span>
       <span style="display:flex;align-items:center;justify-content:flex-end;gap:6px"><i style="display:block;height:5px;background:#d13212;width:${(40*h.fixes/maxFix).toFixed(1)}px"></i><b style="font-weight:600">${h.fixes}</b></span>
       <span class="ell" style="color:#5f6b7a">${esc(h.author)}</span></div>`).join("");
-  document.getElementById("foot").textContent=
-    `net = leverage^${d.damp} + delivery − drag^${d.damp}; the exponent gives diminishing returns so file count alone can't dominate. `+
-    `Bots, generated files, tests and bulk commits (>60 files) are excluded; ranked contributors need ≥${d.min_commits} commits. `+
-    `Hover any pillar or stat for its exact formula. Repo at ${d.head}.`;
+  const P=(t)=>`<p style="margin:0 0 6px">${t}</p>`;
+  const H=(t,c)=>`<div style="font-size:12.5px;font-weight:700;color:${c};margin-bottom:4px">${t}</div>`;
+  const CODE=(t)=>`<div class="mono" style="background:#fafafa;border:1px solid #e9ebed;border-radius:2px;padding:6px 8px;margin:0 0 7px;font-size:11px;overflow-x:auto;white-space:pre">${t}</div>`;
+  document.getElementById("methBody").innerHTML=
+    `<div>${H("Leverage — did others build on it?","#0972d3")}
+      ${P("Summed over every code file the engineer <b>created</b> in the window, each file capped at 45 points:")}
+      ${CODE(`min(fan_in, 40) × 1.0     if fan_in ≥ 2\n+ adopters × 4.0\n+ 5.0                    if in a shared layer\n                         and (fan_in ≥ 2 or adopters > 0)`)}
+      ${P("<b>fan-in</b> — import statements at HEAD referencing this module, matched on trailing path segments so <span class='mono'>foo/types</span> never matches <span class='mono'>bar/types</span>.")}
+      ${P("<b>adopters</b> — distinct other engineers who later modified the file.")}
+      ${P("<b>shared layer</b> — path contains <span class='mono'>lib, common, hooks, models, core, utils, api, schema, providers</span>.")}</div>
+
+     <div>${H("Delivery — how much shipped?","#5f6b7a")}
+      ${CODE("delivery = 6·√commits + 3·√PRs + 2.5·√reviews_given")}
+      ${P("Square roots so raw volume can't dominate: the 400th commit is worth far less than the 4th. Reviews count only on other people's PRs.")}
+      ${H("Exclusions","#5f6b7a")}
+      ${P(`Bots, generated files (migrations, snapshots, vendored, lockfiles), tests, and bulk commits touching more than 60 files. Contributors need ≥${d.min_commits} commits to be ranked — ${d.kpis[2].value - d.engineers.length} of ${d.kpis[2].value} fell below that floor.`)}
+      ${H("Identity","#5f6b7a")}
+      ${P("Each commit is attributed to the GitHub PR author found via the <span class='mono'>(#1234)</span> in the squash-merge subject, falling back to the git email — so one person doesn't split across names.")}</div>
+
+     <div>${H("Drag — what did others have to clean up?","#d13212")}
+      ${P("Summed over drag events, at most two per file per type:")}
+      <table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:7px">
+        <tr style="color:#5f6b7a;text-align:left"><th style="padding:3px 6px 3px 0;font-weight:600">Event</th><th style="padding:3px 0;font-weight:600;text-align:right">Points</th></tr>
+        ${[["Revert — a “Revert” commit references their PR","15"],
+           ["Deleted — a file they created is deleted by someone else within 30 days","8"],
+           [`Hot-fixed — someone else commits fix/bug/regression to their file within ${d.hotfix_window_days} days`,"4"],
+           ["Rewritten by other — someone else removes ≥60% of the lines they added, within 30 days","min(del,400)/30 → max 13.3"],
+           ["Self-rewrite — they remove ≥50% of their own added lines within 30 days","min(del,400)/40 → max 10"]]
+          .map(([l,p])=>`<tr style="border-top:1px solid #e9ebed"><td style="padding:4px 6px 4px 0">${l}</td><td class="mono" style="padding:4px 0;text-align:right;white-space:nowrap;color:#d13212">${p}</td></tr>`).join("")}
+      </table>
+      ${P("Only changes of ≥20 added lines can accrue drag, and a rework whose subject says refactor/cleanup/simplify is not counted as a hot-fix — tidying isn't a defect.")}
+      ${H("Why the 0.75 exponent","#5f6b7a")}
+      ${P("Applied to leverage and drag alike, it gives diminishing returns so an engineer with thousands of files can't dominate purely on count — and so one bad month doesn't erase a quarter of good work.")}
+      ${P(`<span style="color:#879596">Window: ${d.window_days} days to ${d.generated_at.slice(0,10)} · repo at ${d.head}</span>`)}</div>`;
+  const det=document.getElementById("methodology");
+  det.addEventListener("toggle",()=>{document.getElementById("methChev").textContent=det.open?"▾":"▸";});
   document.getElementById("q").oninput=e=>{st.q=e.target.value;render();};
   document.getElementById("toggleRows").onclick=()=>{st.all=!st.all;render();};
   render();
