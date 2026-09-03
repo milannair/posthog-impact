@@ -44,12 +44,36 @@ link_metrics
 SERVER_PID=$!
 echo "[boot] serving on :$PORT (pid $SERVER_PID)"
 
+# /status.json exposes first-boot progress over HTTP. Railway's logs aren't
+# reachable from every environment, and a 40-minute clone-and-sync with no
+# visible progress is indistinguishable from a hang.
+STAGE_FILE="$DATA_DIR/.stage"
+write_status() {
+  local weeks stage
+  stage=$(cat "$STAGE_FILE" 2>/dev/null || echo starting)
+  weeks=$(ls "$CACHE_DIR/prs" 2>/dev/null | grep -c '\.json$' || true)
+  cat > "$SERVE_DIR/status.json" <<EOF
+{"stage":"$stage","repo_cloned":$([ -d "$REPO_DIR/.git" ] && echo true || echo false),
+ "pr_weeks_cached":${weeks:-0},
+ "metrics_present":$([ -f "$METRICS_PATH" ] && echo true || echo false),
+ "metrics_is_seed":$([ -f "$DATA_DIR/.seeded" ] && echo true || echo false),
+ "updated_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+}
+stage() { echo "$1" > "$STAGE_FILE"; write_status; echo "[boot] stage=$1"; }
+# Refresh the week counter while the fetch runs so progress is visible live.
+( while true; do write_status 2>/dev/null || true; sleep 20; done ) &
+TICKER_PID=$!
+trap 'kill $TICKER_PID 2>/dev/null' EXIT
+stage starting
+
 build() {
   # 1. Clone once onto the volume; reuse it on every subsequent boot.
   if [ -d "$REPO_DIR/.git" ]; then
-    echo "[boot] repo already on volume, reusing $REPO_DIR"
+    stage reusing-repo
     git -C "$REPO_DIR" fetch --quiet origin 2>/dev/null || true
   else
+    stage cloning-repo
     echo "[boot] first boot — cloning PostHog/posthog into $REPO_DIR"
     rm -rf "$REPO_DIR"
     # No blob filter: `git log --numstat` needs blob contents, and a blobless
@@ -62,7 +86,7 @@ build() {
   # 2. PR/review data. Always run: weeks already on the volume are skipped, so
   #    this only fetches weeks that are missing plus the current (still-growing)
   #    one. An interrupted run resumes here instead of starting over.
-  echo "[boot] syncing PRs from GitHub (cached weeks are skipped)"
+  stage fetching-prs
   before=$(ls "$CACHE_DIR/prs" 2>/dev/null | wc -l | tr -d ' ')
   python3 /app/pipeline/fetch_github.py || { echo "[boot] fetch failed"; return 1; }
   after=$(ls "$CACHE_DIR/prs" 2>/dev/null | wc -l | tr -d ' ')
@@ -73,14 +97,14 @@ build() {
   if [ -f "$METRICS_PATH" ] && [ ! -f "$DATA_DIR/.seeded" ] && [ "$after" = "$before" ]; then
     echo "[boot] metrics.json is current, skipping analysis"
   else
-    echo "[boot] running analysis"
+    stage analyzing
     python3 /app/pipeline/analyze.py || { echo "[boot] analysis failed"; return 1; }
     rm -f "$DATA_DIR/.seeded"
   fi
 
   link_metrics
-  echo "[boot] ready"
+  stage ready
 }
 
-build || echo "[boot] pipeline incomplete — serving whatever metrics exist"
+build || stage failed
 wait "$SERVER_PID"

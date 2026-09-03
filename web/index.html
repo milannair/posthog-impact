@@ -55,6 +55,11 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
       </div>
     </div>
 
+    <div id="banner" hidden style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#fdf6e9;border:1px solid #e8b84b;border-radius:2px;font-size:12.5px;color:#5f4a16">
+      <i style="flex:none;width:7px;height:7px;border-radius:4px;background:#8a6116"></i>
+      <span id="bannerText"></span>
+    </div>
+
     <div id="kpis" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px"></div>
 
     <div style="flex:1;min-height:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(560px,1fr));gap:12px;align-items:start">
@@ -292,6 +297,22 @@ fetch("metrics.json?v="+Date.now()).then(r=>{if(!r.ok)throw new Error(r.status);
   document.getElementById("q").oninput=e=>{st.q=e.target.value;render();};
   document.getElementById("toggleRows").onclick=()=>{st.all=!st.all;render();};
   render();
+  // The image ships a precomputed metrics.json so the page isn't blank during a
+  // first boot. Say so plainly rather than passing a snapshot off as live data.
+  fetch("status.json?v="+Date.now()).then(r=>r.ok?r.json():null).then(s=>{
+    if(!s) return;
+    const stages={"cloning-repo":"cloning the PostHog repo","reusing-repo":"reading the cloned repo",
+      "fetching-prs":"downloading pull-request history from GitHub","analyzing":"running the analysis",
+      "starting":"starting up","ready":"done","failed":"failed — see container logs"};
+    if(s.metrics_is_seed||s.stage==="failed"){
+      document.getElementById("bannerText").innerHTML=
+        `Showing a <b>precomputed snapshot</b> from ${new Date(D.generated_at).toLocaleString()}, `+
+        `not data built by this server. The container is ${stages[s.stage]||s.stage} `+
+        `(${s.pr_weeks_cached} weeks of PR history cached so far). This page updates once its own run finishes.`;
+      document.getElementById("banner").hidden=false;
+      setTimeout(()=>location.reload(),120000);
+    }
+  }).catch(()=>{});
 }).catch(e=>{
   document.getElementById("hdrSub").textContent=
     "Analysis still building on the server — the repo clone and GitHub sync run once on first boot. Refresh in a few minutes.";
